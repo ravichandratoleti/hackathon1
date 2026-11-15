@@ -23,6 +23,7 @@ app = FastAPI(title="VERITAS AI API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
+
 def packed(row):
     return {"id": row.id, "analysis_type": row.analysis_type, "original_filename": row.original_filename,
             "verdict": row.verdict, "manipulation_likelihood": row.manipulation_likelihood,
@@ -131,3 +132,5 @@ def report(analysis_id: str,db: Session=Depends(get_db)):
     for item in json.loads(row.sources_json): line(f"Source: {item.get('title')} - {item.get('url')}")
     for item in json.loads(row.limitations_json): line("Limitation: "+str(item))
     pdf.save(); return Response(buf.getvalue(),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="veritas-{row.id[:8]}.pdf"'})
+
+
