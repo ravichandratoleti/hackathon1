@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from PIL import Image, UnidentifiedImageError
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -22,6 +22,10 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="VERITAS AI API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/docs")
 
 
 def packed(row):
@@ -132,5 +136,6 @@ def report(analysis_id: str,db: Session=Depends(get_db)):
     for item in json.loads(row.sources_json): line(f"Source: {item.get('title')} - {item.get('url')}")
     for item in json.loads(row.limitations_json): line("Limitation: "+str(item))
     pdf.save(); return Response(buf.getvalue(),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="veritas-{row.id[:8]}.pdf"'})
+
 
 
