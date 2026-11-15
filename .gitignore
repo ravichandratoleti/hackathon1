@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+backend/data/
+backend/tmp/
+*.db
+*.sqlite3
+coverage/
