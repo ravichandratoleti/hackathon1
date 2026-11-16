@@ -5,7 +5,7 @@ type Source={title:string;publisher:string;url:string;snippet:string;published_a
 type Result={id:string;analysis_type:string;original_filename?:string;verdict:string;manipulation_likelihood:number|null;model_confidence:number|null;evidence_coverage:string;summary:string;findings:{type:string;text:string}[];sources:Source[];limitations:string[];created_at:string;claim?:string};
 const modes=[{id:"fact",title:"Fact check",desc:"Check a claim against credible sources.",icon:Newspaper},{id:"image",title:"Image forensics",desc:"Review an image for synthetic media indicators.",icon:FileImage},{id:"video",title:"Video forensics",desc:"Check selected frames for suspicious signals.",icon:FileVideo},{id:"audio",title:"Audio forensics",desc:"Review audio for synthetic speech indicators.",icon:AudioLines}];
 const allowed:Record<string,string>={image:"JPG, PNG, WEBP",video:"MP4, MOV, AVI, WEBM",audio:"WAV, MP3, M4A, FLAC"};
-const API_BASE_URL=process.env.FRONTEND_ORIGIN||"";
+const API_BASE_URL="https://hackathon1-jade-two.vercel.app";
 export default function Home(){
  const [mode,setMode]=useState("fact"),[claim,setClaim]=useState(""),[file,setFile]=useState<File|null>(null),[preview,setPreview]=useState(""),[result,setResult]=useState<Result|null>(null),[history,setHistory]=useState<Result[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState(""),[mobile,setMobile]=useState(false);
  const [health,setHealth]=useState<{status:string;models:Record<string,boolean>;fact_search:boolean;fact_review:boolean}|null>(null);
