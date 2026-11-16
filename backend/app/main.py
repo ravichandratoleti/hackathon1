@@ -5,12 +5,13 @@ from io import BytesIO
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from PIL import Image, UnidentifiedImageError
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
@@ -18,10 +19,24 @@ from .models import Analysis
 from .services import assess_claim, classify_image, search_sources
 from .schemas import DISCLAIMER
 
-Base.metadata.create_all(bind=engine)
+try:
+    # create_all creates missing tables without dropping or rewriting existing data.
+    Base.metadata.create_all(bind=engine)
+except SQLAlchemyError as exc:
+    raise RuntimeError(
+        "Database initialization failed. Check DATABASE_URL connectivity and database permissions."
+    ) from exc
 app = FastAPI(title="VERITAS AI API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request: Request, exc: SQLAlchemyError):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The database is temporarily unavailable. Please retry shortly."},
+    )
 
 @app.get("/")
 def root():
