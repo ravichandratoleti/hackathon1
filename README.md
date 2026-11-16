@@ -29,7 +29,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000. The frontend uses `/api` and Next.js proxies it to `http://localhost:8000` by default. Set `BACKEND_URL` before starting Next.js to change the backend URL.
+Open http://localhost:3000. Frontend API requests use `FRONTEND_ORIGIN` as their base URL when set, and default to the current origin otherwise. Next.js proxies `/api` to `http://localhost:8000` by default; set `BACKEND_URL` before starting Next.js to change the backend URL. If you set `FRONTEND_ORIGIN`, use the frontend's origin (for example, `http://localhost:3000`) and restart Next.js.
 
 ## Configuration
 
