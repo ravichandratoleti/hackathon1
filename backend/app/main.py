@@ -27,7 +27,22 @@ except SQLAlchemyError as exc:
         "Database initialization failed. Check DATABASE_URL connectivity and database permissions."
     ) from exc
 app = FastAPI(title="VERITAS AI API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
+allowed_origins = {
+    "http://localhost:3000",
+    "https://hackathon1-9s6d-ih8wk8vod-idkme.vercel.app",
+}
+allowed_origins.update(
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRONTEND_ORIGIN", "").split(",")
+    if origin.strip()
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(allowed_origins),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
 
