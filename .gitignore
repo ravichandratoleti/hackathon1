@@ -12,3 +12,4 @@ backend/tmp/
 *.db
 *.sqlite3
 coverage/
+.vscode/
