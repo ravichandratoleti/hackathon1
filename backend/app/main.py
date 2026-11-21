@@ -1,4 +1,5 @@
 import json, os, uuid
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
@@ -16,8 +17,10 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import Analysis
-from .services import assess_claim, classify_image, search_sources
+from .services import EvidenceRetrievalError, analyze_evidence_gemini, assess_claim, classify_image, search_provider_configured, search_sources
 from .schemas import DISCLAIMER
+
+logger = logging.getLogger(__name__)
 
 try:
     # create_all creates missing tables without dropping or rewriting existing data.
@@ -75,16 +78,39 @@ def save(db, kind, filename, verdict, summary, findings=None, sources=None, limi
 @app.get("/api/health")
 def health():
     return {"status":"ok", "models":{"image":bool(os.getenv("HF_API_TOKEN") and os.getenv("HF_IMAGE_MODEL")),"video":False,"audio":False},
-            "fact_search":bool(os.getenv("GOOGLE_CSE_API_KEY") and os.getenv("GOOGLE_CSE_CX")),"fact_review":bool(os.getenv("OPENAI_API_KEY"))}
+            "fact_search":search_provider_configured(),"fact_review":bool(os.getenv("OPENAI_API_KEY"))}
 
 @app.post("/api/fact-check")
 async def fact_check(payload: dict, db: Session=Depends(get_db)):
     claim=str(payload.get("claim", "")).strip()
     if len(claim)<8 or len(claim)>5000: raise HTTPException(400,"Enter a claim between 8 and 5,000 characters.")
     try:
-        sources=await search_sources(claim); assessment=await assess_claim(claim,sources)
-    except Exception:
-        sources=[]; assessment={"verdict":"insufficient_evidence","explanation":"Live verification could not be completed. Check provider configuration and try again.","findings":[],"limitations":["The configured provider returned an error."]}
+        sources=await search_sources(claim)
+    except EvidenceRetrievalError as exc:
+        sources=[]
+        assessment={"verdict":"insufficient_evidence","explanation":str(exc),"findings":[],"limitations":["No source evidence was retrieved, so no factual verdict was generated."]}
+    except Exception as exc:
+        logger.error("Unexpected evidence retrieval failure (%s)", type(exc).__name__)
+        sources=[]
+        assessment={"verdict":"insufficient_evidence","explanation":"Evidence retrieval is unavailable because the search provider returned an unexpected error.","findings":[],"limitations":["No source evidence was retrieved, so no factual verdict was generated."]}
+    else:
+        if not sources:
+            assessment=await assess_claim(claim,[])
+        else:
+            gemini_analysis=None
+            gemini_failed=False
+            try:
+                gemini_analysis=await analyze_evidence_gemini(claim,sources)
+            except Exception as exc:
+                logger.error("Gemini evidence analysis failed (%s)", type(exc).__name__)
+                gemini_failed=True
+            try:
+                assessment=await assess_claim(claim,sources,gemini_analysis=gemini_analysis)
+            except Exception as exc:
+                logger.error("OpenAI verdict review failed (%s)", type(exc).__name__)
+                assessment={"verdict":"insufficient_evidence","explanation":"Evidence was retrieved, but verdict review is unavailable.","findings":[],"limitations":["The configured verdict reviewer returned an error; no factual verdict was generated."]}
+            if gemini_failed:
+                assessment.setdefault("limitations",[]).append("Gemini preliminary evidence analysis was unavailable; the verdict reviewer received the retrieved source snippets directly.")
     findings=[{"type":"claim","text":claim}, *[{"type":"evidence","text":x} for x in assessment.get("findings",[])] ]
     row=save(db,"fact_check",None,assessment["verdict"],assessment.get("explanation",""),findings,sources,assessment.get("limitations",[]),coverage="search_snippets" if sources else "none")
     return {**packed(row),"claim":claim}
@@ -163,7 +189,7 @@ def report(analysis_id: str,db: Session=Depends(get_db)):
     line("VERITAS AI - Verification report"); line(f"ID: {row.id}"); line(f"Type: {row.analysis_type}"); line(f"Verdict: {row.verdict}")
     line(f"Created: {row.created_at.isoformat()}"); line(f"Summary: {row.summary}")
     for item in json.loads(row.findings_json): line("Finding: "+str(item.get("text",item)))
-    for item in json.loads(row.sources_json): line(f"Source: {item.get('title')} - {item.get('url')}")
+    for item in json.loads(row.sources_json): line(f"Source: {item.get('title')} - {item.get('publisher')} [{item.get('provider', 'unknown provider')}] - {item.get('url')}")
     for item in json.loads(row.limitations_json): line("Limitation: "+str(item))
     pdf.save(); return Response(buf.getvalue(),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="veritas-{row.id[:8]}.pdf"'})
 
