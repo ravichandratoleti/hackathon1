@@ -3,6 +3,7 @@ import unittest
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine
@@ -164,6 +165,24 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(response.json()["sources"], [source])
         reviewer.assert_awaited_once_with("A factual claim with enough length.", [source], gemini_analysis=None)
         self.assertTrue(any("Gemini preliminary evidence analysis was unavailable" in x for x in response.json()["limitations"]))
+
+    def test_openai_review_failure_is_never_returned_as_a_successful_verdict(self):
+        source = {"title": "Source", "publisher": "example.org", "url": "https://example.org", "snippet": "Evidence", "provider": "Tavily"}
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        provider_response = httpx.Response(401, json={"error": {"code": "invalid_api_key"}}, request=request)
+        failure = httpx.HTTPStatusError("HTTP 401", request=request, response=provider_response)
+        with patch.object(main, "search_sources", new=AsyncMock(return_value=[source])), patch.object(
+            main, "analyze_evidence_gemini", new=AsyncMock(return_value="Preliminary")
+        ), patch.object(main, "assess_claim", new=AsyncMock(side_effect=failure)):
+            response = self.client.post("/api/fact-check", json={"claim": "A factual claim with enough length."})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["verdict"], "insufficient_evidence")
+        self.assertEqual(body["evidence_coverage"], "search_snippets")
+        self.assertEqual(body["sources"], [source])
+        self.assertIn("review is unavailable", body["summary"])
+        self.assertTrue(any("no factual verdict" in item.lower() for item in body["limitations"]))
 
     def test_invalid_claim_is_rejected_before_provider_calls(self):
         with patch.object(main, "search_sources", new=AsyncMock()) as search:

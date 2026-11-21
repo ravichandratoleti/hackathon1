@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import json
 import os
 import unittest
@@ -260,6 +261,23 @@ class ServicesTests(unittest.TestCase):
         self.assertIn("Source says it occurred.", client.request["input"])
         self.assertIn("Source says it did not occur.", client.request["input"])
 
+    def test_missing_gemini_sdk_logs_exact_missing_module_safely(self):
+        original_import = builtins.__import__
+
+        def import_without_genai(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "google" and "genai" in (fromlist or ()):
+                raise ModuleNotFoundError("No module named 'google.genai'", name="google.genai")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "dummy-gemini-key"}), patch(
+            "builtins.__import__", side_effect=import_without_genai
+        ), self.assertLogs(services.logger, level="ERROR") as logs:
+            with self.assertRaisesRegex(RuntimeError, "SDK dependency"):
+                asyncio.run(services.analyze_evidence_gemini("A factual claim", []))
+        self.assertTrue(any("missing_module=google.genai" in line for line in logs.output))
+        self.assertTrue(any("google-genai" in line for line in logs.output))
+        self.assertFalse(any("dummy-gemini-key" in line for line in logs.output))
+
     def test_no_sources_returns_unavailable_without_an_openai_request(self):
         FakeAsyncHTTPClient.calls = []
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-token"}), patch.object(
@@ -312,6 +330,41 @@ class ServicesTests(unittest.TestCase):
         self.assertEqual(request["headers"]["Authorization"], "Bearer test-token")
         user_prompt = json.loads(request["json"]["messages"][1]["content"])
         self.assertEqual(user_prompt["sources"][0]["url"], source["url"])
+
+    def test_openai_http_error_logs_status_and_redacted_provider_body(self):
+        request = services.httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        fake_key = "sk-proj-" + "fake-secret-value"
+        response = services.httpx.Response(
+            401,
+            json={"error": {
+                "message": f"Incorrect API key provided: {fake_key}",
+                "type": "authentication_error",
+                "param": None,
+                "code": "invalid_api_key",
+            }},
+            headers={"x-request-id": "req-test-123"},
+            request=request,
+        )
+        failure = services.httpx.HTTPStatusError("HTTP 401", request=request, response=response)
+
+        class HTTPErrorClient(FakeAsyncHTTPClient):
+            async def post(self, url, **kwargs):
+                raise failure
+
+        source = {"title": "Example", "url": "https://example.org", "snippet": "Evidence"}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "dummy-openai-key", "OPENAI_MODEL": "gpt-4o-mini"}), patch.object(
+            services.httpx, "AsyncClient", HTTPErrorClient
+        ), self.assertLogs(services.logger, level="ERROR") as logs:
+            with self.assertRaises(services.httpx.HTTPStatusError):
+                asyncio.run(services.assess_claim("A factual claim", [source]))
+
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("status=401", joined_logs)
+        self.assertIn("invalid_api_key", joined_logs)
+        self.assertIn("req-test-123", joined_logs)
+        self.assertIn("[REDACTED]", joined_logs)
+        self.assertNotIn(fake_key, joined_logs)
+        self.assertNotIn("dummy-openai-key", joined_logs)
 
     def test_openai_verdict_reviewer_receives_gemini_analysis_as_untrusted_context(self):
         source = {"title": "Example", "publisher": "example.org", "url": "https://example.org", "snippet": "Evidence"}
