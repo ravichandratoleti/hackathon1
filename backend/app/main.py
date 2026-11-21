@@ -9,7 +9,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from PIL import Image, UnidentifiedImageError
+from PIL import ExifTags, Image, UnidentifiedImageError
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sqlalchemy.exc import SQLAlchemyError
@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import Analysis
-from .services import EvidenceRetrievalError, analyze_evidence_gemini, assess_claim, classify_image, search_provider_configured, search_sources
+from .services import EvidenceRetrievalError, analyze_evidence_gemini, analyze_image_gemini, analyze_media_gemini, assess_claim, gemini_image_configured, gemini_media_configured, search_provider_configured, search_sources
 from .schemas import DISCLAIMER
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,8 @@ def save(db, kind, filename, verdict, summary, findings=None, sources=None, limi
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "models":{"image":bool(os.getenv("HF_API_TOKEN") and os.getenv("HF_IMAGE_MODEL")),"video":False,"audio":False},
+    gemini_ready=gemini_media_configured()
+    return {"status":"ok", "models":{"image":gemini_image_configured(),"video":gemini_ready,"audio":gemini_ready},
             "fact_search":search_provider_configured(),"fact_review":bool(os.getenv("OPENAI_API_KEY"))}
 
 @app.post("/api/fact-check")
@@ -123,42 +124,102 @@ async def read_upload(file, allowed):
     if len(data)>MAX_BYTES: raise HTTPException(413,f"File exceeds the {MAX_BYTES//(1024*1024)} MB upload limit.")
     return data
 
+
+def selected_image_metadata(image: Image.Image) -> dict[str, str]:
+    """Return a small technical EXIF allowlist; intentionally omit GPS and comments."""
+    tags = {
+        "DateTime", "DateTimeOriginal", "DateTimeDigitized", "Make", "Model", "Software",
+        "Orientation", "ImageWidth", "ImageLength", "ExifImageWidth", "ExifImageHeight",
+    }
+    try:
+        exif = image.getexif()
+    except (OSError, TypeError, ValueError):
+        return {}
+    metadata: dict[str, str] = {}
+    for tag_id, value in exif.items():
+        name = ExifTags.TAGS.get(tag_id)
+        if name not in tags or isinstance(value, (bytes, bytearray)):
+            continue
+        value_text = str(value).strip()
+        if value_text:
+            metadata[name] = value_text[:160]
+    return metadata
+
 @app.post("/api/analyze/image")
 async def analyze_image(file: UploadFile=File(...), db: Session=Depends(get_db)):
     data=await read_upload(file,{".jpg",".jpeg",".png",".webp"})
     try:
         image=Image.open(BytesIO(data)); image.verify()
-        with Image.open(BytesIO(data)) as img: width,height,fmt=img.width,img.height,img.format
+        with Image.open(BytesIO(data)) as img:
+            width,height,fmt=img.width,img.height,img.format
+            embedded_metadata=selected_image_metadata(img)
     except (UnidentifiedImageError,OSError,ValueError): raise HTTPException(400,"The uploaded file is not a readable image.")
     findings=[{"type":"metadata","text":f"Readable {fmt} image, {width} × {height} pixels. Metadata alone does not establish authenticity."}]
-    configured=bool(os.getenv("HF_API_TOKEN") and os.getenv("HF_IMAGE_MODEL"))
+    if embedded_metadata:
+        findings.append({"type":"metadata_evidence","text":"Selected embedded EXIF fields: "+", ".join(f"{key}={value}" for key,value in sorted(embedded_metadata.items()))})
+    else:
+        findings.append({"type":"metadata_evidence","text":"No selected embedded EXIF fields were available for comparison."})
+    configured=gemini_image_configured()
     model_failed=False
-    try: result=await classify_image(data)
-    except Exception: result=None; model_failed=True
+    result=None
+    if configured:
+        try:
+            mime_type=Image.MIME.get(fmt or "", "application/octet-stream")
+            metadata_context={
+                "container_format":str(fmt or "unknown"),
+                "width_px":str(width),
+                "height_px":str(height),
+                **embedded_metadata,
+            }
+            result=await analyze_image_gemini(data,mime_type,metadata_context)
+        except Exception as exc:
+            logger.error("Gemini image route failed error_type=%s", type(exc).__name__)
+            model_failed=True
     if result:
-        scores=result["scores"]
-        findings.append({"type":"model","text":f"Classifier {result['model']} returned labels: "+", ".join(f"{x.get('label','unknown')} ({x.get('score',0):.3f})" for x in scores[:5])})
-        suspect=next((x for x in scores if any(w in x.get("label","").lower() for w in ("fake","synthetic","ai-generated","artificial"))),None)
-        likelihood=suspect.get("score") if suspect else None
-        confidence=max((x.get("score",0) for x in scores),default=None)
-        verdict="potentially_manipulated" if likelihood is not None and likelihood>=0.65 else "inconclusive"
-        summary="Classifier output is only an indicator; labels and calibration depend on the configured model."
-        limits=["This classifier may not detect edits or generated images reliably. Review independently."]
-        coverage="whole_image_classifier"
+        for observation in result["visual_observations"]:
+            findings.append({"type":"visual_observation","text":observation})
+        for observation in result["metadata_observations"]:
+            findings.append({"type":"metadata_observation","text":observation})
+        for reason in result["inconclusive_reasons"]:
+            findings.append({"type":"inconclusive","text":reason})
+        likelihood=confidence=None
+        verdict="inconclusive"
+        summary="Gemini returned visual observations and a review of available metadata. No authenticity verdict or confidence score was assigned."
+        limits=["Visual observations are model-generated indicators and do not prove authenticity or manipulation.","Embedded metadata may be missing, altered, or inconsistent with the image content."]
+        coverage="gemini_image_review"
     else:
         likelihood=confidence=None; verdict="inconclusive"
         summary="Image received and validated, but no authenticity assessment was performed. " + ("The configured model service did not return a usable result." if configured else "No image detection model is configured.")
-        limits=["Check the configured model ID, token, and inference service." if model_failed else "Configure HF_API_TOKEN and HF_IMAGE_MODEL to enable model inference."]
+        limits=["Check GEMINI_API_KEY, GEMINI_IMAGE_MODEL, SDK availability, and the provider error logs." if model_failed else "Configure GEMINI_API_KEY and GEMINI_IMAGE_MODEL to enable image analysis."]
         coverage="metadata_only"
     row=save(db,"image",Path(file.filename or "image").name,verdict,summary,findings,limitations=limits,likelihood=likelihood,confidence=confidence,coverage=coverage)
     return packed(row)
 
 @app.post("/api/analyze/{kind}")
 async def unavailable_media(kind: str,file: UploadFile=File(...),db: Session=Depends(get_db)):
-    types={"video":{".mp4",".mov",".avi",".webm"},"audio":{".wav",".mp3",".m4a",".flac"}}
-    if kind not in types: raise HTTPException(404,"Unknown analysis type.")
-    await read_upload(file,types[kind]); label=kind.title()
-    row=save(db,kind,Path(file.filename or kind).name,"inconclusive",f"{label} upload validated; a compatible analysis model is not configured, so no detection was performed.",limitations=[f"{label} detection is unavailable in this prototype."],coverage="none")
+    extensions={"video":{".mp4":"video/mp4", ".mov":"video/quicktime", ".avi":"video/x-msvideo", ".webm":"video/webm"},
+                "audio":{".wav":"audio/wav", ".mp3":"audio/mpeg", ".m4a":"audio/mp4", ".flac":"audio/flac"}}
+    if kind not in extensions: raise HTTPException(404,"Unknown analysis type.")
+    data=await read_upload(file,set(extensions[kind])); label=kind.title()
+    findings=[]
+    limitations=["Model generated observations are not an authenticity determination; review the original media independently."]
+    configured=gemini_media_configured()
+    if configured:
+        try:
+            observations=await analyze_media_gemini(data,kind,extensions[kind][Path(file.filename or "").suffix.lower()])
+            findings.append({"type":"model", "text":observations})
+            summary=f"Gemini analyzed the {kind} and returned observations. No authenticity verdict was generated."
+            coverage="gemini_multimodal_analysis"
+        except Exception as exc:
+            logger.error("Gemini %s route failed error_type=%s", kind, type(exc).__name__)
+            summary=f"{label} was received, but Gemini analysis failed. No model assessment was performed."
+            limitations.append("Gemini media analysis failed; check the configured key, model access, and provider status.")
+            coverage="analysis_failed"
+    else:
+        summary=f"{label} upload validated, but Gemini media analysis is not configured; no model assessment was performed."
+        limitations.append("Configure GEMINI_API_KEY and ensure the google-genai dependency is installed.")
+        coverage="none"
+    row=save(db,kind,Path(file.filename or kind).name,"inconclusive",summary,findings,limitations=limitations,coverage=coverage)
     return packed(row)
 
 @app.get("/api/history")
