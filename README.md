@@ -6,7 +6,7 @@ VERITAS AI is a local-first verification workbench for claims and media. It is e
 
 - Node.js 20+
 - Python 3.10+
-- Optional: a Tavily API key for web evidence retrieval, a Gemini API key for evidence and media analysis, and an OpenAI API key for final fact-check review.
+- Optional: a Tavily API key for web evidence retrieval and a Gemini API key for fact-check and media analysis.
 
 ## Run on Windows
 
@@ -33,7 +33,7 @@ Open http://localhost:3000. Frontend API requests use `FRONTEND_ORIGIN` as their
 
 ## Configuration
 
-See `backend/.env.example`. Fact checks retrieve up to five web results from Tavily using `TAVILY_API_KEY` (basic search only). Gemini, configured with `GEMINI_API_KEY` and `GEMINI_MODEL`, provides preliminary analysis of those snippets; OpenAI, configured with `OPENAI_API_KEY` and `OPENAI_MODEL`, remains responsible for the final verdict. Image, video, and audio observations use Gemini; image analysis uses `GEMINI_IMAGE_MODEL`. Media findings remain inconclusive and include no model-generated confidence score. Retrieval errors or empty results produce an insufficient-evidence response and never substitute generated citations. Missing OpenAI credentials or review errors likewise produce no factual verdict. Provider quotas and billing settings are controlled by those providers.
+See `backend/.env.example`. Fact checks retrieve up to five web results from Tavily using `TAVILY_API_KEY` (basic search only). Gemini, configured with `GEMINI_API_KEY` and `GEMINI_MODEL`, reviews the retrieved snippets and returns a structured verdict. Image, video, and audio observations use Gemini; image analysis uses `GEMINI_IMAGE_MODEL`. Media findings remain inconclusive and include no model-generated confidence score. Retrieval errors or empty results return insufficient evidence; Gemini review failures return `review_unavailable` with no factual verdict. Neither case substitutes generated citations. Provider quotas and billing settings are controlled by those providers.
 
 The SQLite database is created at `backend/data/veritas.db`. Uploads are handled as temporary request data and are not retained after processing; the multipart framework may spool larger uploads to its temporary directory. Only analysis metadata, findings, and retrieved source snippets are persisted. History deletion removes the stored record. Reports are generated from stored analysis data.
 

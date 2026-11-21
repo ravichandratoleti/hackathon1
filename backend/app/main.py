@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .models import Analysis
-from .services import EvidenceRetrievalError, analyze_evidence_gemini, analyze_image_gemini, analyze_media_gemini, assess_claim, gemini_image_configured, gemini_media_configured, search_provider_configured, search_sources
+from .services import EvidenceRetrievalError, analyze_image_gemini, analyze_media_gemini, assess_claim, gemini_image_configured, gemini_media_configured, search_provider_configured, search_sources
 from .schemas import DISCLAIMER
 
 logger = logging.getLogger(__name__)
@@ -79,41 +79,33 @@ def save(db, kind, filename, verdict, summary, findings=None, sources=None, limi
 def health():
     gemini_ready=gemini_media_configured()
     return {"status":"ok", "models":{"image":gemini_image_configured(),"video":gemini_ready,"audio":gemini_ready},
-            "fact_search":search_provider_configured(),"fact_review":bool(os.getenv("OPENAI_API_KEY"))}
+            "fact_search":search_provider_configured(),"fact_review":gemini_media_configured()}
 
 @app.post("/api/fact-check")
 async def fact_check(payload: dict, db: Session=Depends(get_db)):
     claim=str(payload.get("claim", "")).strip()
     if len(claim)<8 or len(claim)>5000: raise HTTPException(400,"Enter a claim between 8 and 5,000 characters.")
+    request_id=uuid.uuid4().hex[:12]
+    logger.info("Fact-check request started request_id=%s claim_length=%d", request_id, len(claim))
     try:
         sources=await search_sources(claim)
     except EvidenceRetrievalError as exc:
+        logger.warning("Fact-check evidence retrieval unavailable request_id=%s error_type=%s", request_id, type(exc).__name__)
         sources=[]
         assessment={"verdict":"insufficient_evidence","explanation":str(exc),"findings":[],"limitations":["No source evidence was retrieved, so no factual verdict was generated."]}
     except Exception as exc:
-        logger.error("Unexpected evidence retrieval failure (%s)", type(exc).__name__)
+        logger.error("Unexpected evidence retrieval failure request_id=%s error_type=%s", request_id, type(exc).__name__)
         sources=[]
         assessment={"verdict":"insufficient_evidence","explanation":"Evidence retrieval is unavailable because the search provider returned an unexpected error.","findings":[],"limitations":["No source evidence was retrieved, so no factual verdict was generated."]}
     else:
+        logger.info("Fact-check evidence retrieval completed request_id=%s source_count=%d", request_id, len(sources))
         if not sources:
             assessment=await assess_claim(claim,[])
         else:
-            gemini_analysis=None
-            gemini_failed=False
-            try:
-                gemini_analysis=await analyze_evidence_gemini(claim,sources)
-            except Exception as exc:
-                logger.error("Gemini evidence analysis failed (%s)", type(exc).__name__)
-                gemini_failed=True
-            try:
-                assessment=await assess_claim(claim,sources,gemini_analysis=gemini_analysis)
-            except Exception as exc:
-                logger.error("OpenAI verdict review failed (%s)", type(exc).__name__)
-                assessment={"verdict":"insufficient_evidence","explanation":"Evidence was retrieved, but verdict review is unavailable.","findings":[],"limitations":["The configured verdict reviewer returned an error; no factual verdict was generated."]}
-            if gemini_failed:
-                assessment.setdefault("limitations",[]).append("Gemini preliminary evidence analysis was unavailable; the verdict reviewer received the retrieved source snippets directly.")
+            assessment=await assess_claim(claim,sources)
     findings=[{"type":"claim","text":claim}, *[{"type":"evidence","text":x} for x in assessment.get("findings",[])] ]
-    row=save(db,"fact_check",None,assessment["verdict"],assessment.get("explanation",""),findings,sources,assessment.get("limitations",[]),coverage="search_snippets" if sources else "none")
+    row=save(db,"fact_check",None,assessment["verdict"],assessment.get("explanation",""),findings,sources,assessment.get("limitations",[]),confidence=assessment.get("model_confidence"),coverage="search_snippets" if sources else "none")
+    logger.info("Fact-check request completed request_id=%s report_id=%s verdict=%s confidence_available=%s source_count=%d", request_id, row.id, row.verdict, row.model_confidence is not None, len(sources))
     return {**packed(row),"claim":claim}
 
 async def read_upload(file, allowed):

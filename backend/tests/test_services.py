@@ -1,12 +1,12 @@
 import asyncio
-import builtins
 import json
 import os
 import unittest
 from types import SimpleNamespace
-from typing import TypeGuard, TypedDict, TypeVar
+from typing import TypedDict, TypeVar
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from google import genai
 from google.genai import types
 
@@ -27,33 +27,15 @@ class TavilyRequestBody(TypedDict):
     include_usage: bool
 
 
-class OpenAIRequestMessage(TypedDict):
-    role: str
-    content: str
-
-
-class OpenAIRequestBody(TypedDict):
-    model: str
-    temperature: int
-    response_format: dict[str, str]
-    messages: list[OpenAIRequestMessage]
-
-
 class CapturedHTTPCall(TypedDict):
     headers: dict[str, str]
-    json: TavilyRequestBody | OpenAIRequestBody
+    json: TavilyRequestBody
 
 
 class GeminiSearchRequest(TypedDict):
     model: str
     input: str
     tools: list[dict[str, str]]
-    store: bool
-
-
-class GeminiEvidenceRequest(TypedDict):
-    model: str
-    input: str
     store: bool
 
 
@@ -79,26 +61,8 @@ def required(value: T | None, description: str) -> T:
     return value
 
 
-def is_tavily_body(body: TavilyRequestBody | OpenAIRequestBody) -> TypeGuard[TavilyRequestBody]:
-    return "query" in body
-
-
-def is_openai_body(body: TavilyRequestBody | OpenAIRequestBody) -> TypeGuard[OpenAIRequestBody]:
-    return "messages" in body
-
-
 def tavily_body(call: CapturedHTTPCall) -> TavilyRequestBody:
-    body = call["json"]
-    if not is_tavily_body(body):
-        raise AssertionError("Expected captured Tavily request")
-    return body
-
-
-def openai_body(call: CapturedHTTPCall) -> OpenAIRequestBody:
-    body = call["json"]
-    if not is_openai_body(body):
-        raise AssertionError("Expected captured OpenAI request")
-    return body
+    return call["json"]
 
 
 def citation(url="https://example.org/report", title="Example report", start=0, end=12):
@@ -152,7 +116,7 @@ class FakeAsyncHTTPClient:
         url: str,
         *,
         headers: dict[str, str],
-        json: TavilyRequestBody | OpenAIRequestBody,
+        json: TavilyRequestBody,
     ) -> FakeHTTPResponse:
         self.calls.append((url, {"headers": headers, "json": json}))
         error = self.error
@@ -326,7 +290,7 @@ class ServicesTests(unittest.TestCase):
                 url: str,
                 *,
                 headers: dict[str, str],
-                json: TavilyRequestBody | OpenAIRequestBody,
+                json: TavilyRequestBody,
             ) -> FakeHTTPResponse:
                 self.calls.append((url, {"headers": headers, "json": json}))
                 return InvalidJSONResponse(None, 200)
@@ -349,177 +313,167 @@ class ServicesTests(unittest.TestCase):
         self.assertTrue(callable(services.search_sources_gemini))
         self.assertTrue(callable(services._sources_from_gemini_interaction))
 
-    def test_gemini_analysis_uses_configured_model_without_search_tool(self):
-        class FakeGeminiClient:
-            request: GeminiEvidenceRequest | None = None
-
-            def __init__(self, api_key: str) -> None:
-                self.interactions = self
-
-            def create(self, *, model: str, input: str, store: bool) -> SimpleNamespace:
-                self.request = {"model": model, "input": input, "store": store}
-                return SimpleNamespace(output_text="Evidence is mixed; source 1 supports a narrower claim.")
-
-            def close(self) -> None:
-                pass
-
-        client = FakeGeminiClient("test-token")
-        evidence_sources = [{"title":"A", "publisher":"example.org", "snippet":"Source says it occurred."}, {"title":"B", "publisher":"example.net", "snippet":"Source says it did not occur."}]
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-token"}), patch.object(
-            genai, "Client", return_value=client
-        ):
-            analysis = asyncio.run(services.analyze_evidence_gemini("A factual claim", evidence_sources))
-        self.assertEqual(analysis, "Evidence is mixed; source 1 supports a narrower claim.")
-        request = required(client.request, "Gemini analysis request")
-        self.assertEqual(request["model"], services.GEMINI_MODEL)
-        self.assertNotIn("tools", request)
-        self.assertFalse(request["store"])
-        self.assertIn("Source says it occurred.", request["input"])
-        self.assertIn("Source says it did not occur.", request["input"])
-
-    def test_missing_gemini_sdk_logs_exact_missing_module_safely(self):
-        original_import = builtins.__import__
-
-        def import_without_genai(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "google" and "genai" in (fromlist or ()):
-                raise ModuleNotFoundError("No module named 'google.genai'", name="google.genai")
-            return original_import(name, globals, locals, fromlist, level)
-
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "dummy-gemini-key"}), patch(
-            "builtins.__import__", side_effect=import_without_genai
-        ), self.assertLogs(services.logger, level="ERROR") as logs:
-            with self.assertRaisesRegex(RuntimeError, "SDK dependency"):
-                asyncio.run(services.analyze_evidence_gemini("A factual claim", []))
-        self.assertTrue(any("missing_module=google.genai" in line for line in logs.output))
-        self.assertTrue(any("google-genai" in line for line in logs.output))
-        self.assertFalse(any("dummy-gemini-key" in line for line in logs.output))
-
-    def test_no_sources_returns_unavailable_without_an_openai_request(self):
-        FakeAsyncHTTPClient.calls = []
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-token"}), patch.object(
-            services.httpx, "AsyncClient", FakeAsyncHTTPClient
-        ):
+    def test_no_sources_returns_unavailable_without_a_gemini_request(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-token"}):
             result = asyncio.run(services.assess_claim("A factual claim", []))
-
         self.assertEqual(result["verdict"], "insufficient_evidence")
         self.assertIn("Evidence retrieval is unavailable", result["explanation"])
-        self.assertEqual(FakeAsyncHTTPClient.calls, [])
 
-    def test_missing_openai_key_returns_insufficient_evidence(self):
+    def test_missing_gemini_key_returns_review_unavailable(self):
         source = {"title": "Source", "url": "https://example.org", "snippet": "Text"}
-        FakeAsyncHTTPClient.calls = []
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), patch.object(
-            services.httpx, "AsyncClient", FakeAsyncHTTPClient
-        ):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
             result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIn("GEMINI_API_KEY", result["limitations"][0])
 
-        self.assertEqual(result["verdict"], "insufficient_evidence")
-        self.assertEqual(FakeAsyncHTTPClient.calls, [])
+    def test_gemini_verdict_uses_configured_model_structured_schema_and_source_metadata(self):
+        source = {"title":"Example report", "publisher":"Example News", "url":"https://example.org/report", "published_at":"2025-03-01", "snippet":"Evidence text."}
+        sources = [source, *[
+            {"title":f"Report {index}", "publisher":f"Publisher {index}", "url":f"https://example.org/{index}", "published_at":None, "snippet":f"Evidence snippet {index}."}
+            for index in range(2, 6)
+        ]]
 
-    def test_openai_verdict_generation_uses_mocked_response(self):
-        source = {
-            "title": "Example report",
-            "publisher": "example.org",
-            "url": "https://example.org/report",
-            "snippet": "Evidence text.",
-        }
-        FakeAsyncHTTPClient.calls = []
-        FakeAsyncHTTPClient.payload = {
-            "choices": [{"message": {"content": json.dumps({
-                "verdict": "supported",
-                "explanation": "The supplied evidence supports the claim.",
-                "findings": ["Evidence text supports it."],
-            })}}]
-        }
+        class FakeGeminiClient:
+            request = None
+            closed = False
+            def __init__(self, *, api_key, http_options):
+                FakeGeminiClient.http_options = http_options
+                self.models = self
+            def generate_content(self, *, model, contents, config):
+                FakeGeminiClient.request = {"model":model, "contents":contents, "config":config}
+                payload = {"verdict":"TRUE", "summary":"The supplied evidence supports the claim.", "model_confidence":0.88, "evidence_coverage":"Two independent sources directly address the claim.", "findings":["Both sources agree."], "supporting_evidence":["Evidence text."], "contradicting_evidence":[], "limitations":[]}
+                return SimpleNamespace(text=json.dumps(payload))
+            def close(self):
+                FakeGeminiClient.closed = True
 
-        with patch.dict(os.environ, {
-            "OPENAI_API_KEY": "test-token",
-            "OPENAI_MODEL": "test-verdict-model",
-        }), patch.object(services.httpx, "AsyncClient", FakeAsyncHTTPClient):
-            result = asyncio.run(services.assess_claim("A factual claim", [source]))
-
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token", "GEMINI_MODEL":"test-gemini-model"}), patch.object(genai, "Client", FakeGeminiClient):
+            result = asyncio.run(services.assess_claim("A factual claim", sources))
         self.assertEqual(result["verdict"], "supported")
-        self.assertEqual(result["findings"], ["Evidence text supports it."])
-        url, request = FakeAsyncHTTPClient.calls[0]
-        body = openai_body(request)
-        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
-        self.assertEqual(body["model"], "test-verdict-model")
-        self.assertEqual(request["headers"]["Authorization"], "Bearer test-token")
-        user_prompt = json.loads(body["messages"][1]["content"])
-        self.assertEqual(user_prompt["sources"][0]["url"], source["url"])
+        self.assertEqual(result["model_confidence"], 0.88)
+        self.assertTrue(FakeGeminiClient.closed)
+        request = required(FakeGeminiClient.request, "Gemini verdict request")
+        self.assertEqual(request["model"], "test-gemini-model")
+        self.assertEqual(FakeGeminiClient.http_options.timeout, services.GEMINI_VERDICT_TIMEOUT_MS)
+        self.assertEqual(request["config"].response_mime_type, "application/json")
+        self.assertIs(request["config"].response_schema, services.GeminiVerdictReview)
+        self.assertNotIn("additionalProperties", services.GeminiVerdictReview.model_json_schema())
+        self.assertIn('"claim": "A factual claim"', request["contents"])
+        for supplied in sources:
+            for field in ("title", "publisher", "url", "snippet"):
+                self.assertIn(supplied[field], request["contents"])
 
-    def test_openai_http_error_logs_status_and_redacted_provider_body(self):
-        request = services.httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-        fake_key = "sk-proj-" + "fake-secret-value"
-        response = services.httpx.Response(
-            401,
-            json={"error": {
-                "message": f"Incorrect API key provided: {fake_key}",
-                "type": "authentication_error",
-                "param": None,
-                "code": "invalid_api_key",
-            }},
-            headers={"x-request-id": "req-test-123"},
-            request=request,
-        )
-        failure = services.httpx.HTTPStatusError("HTTP 401", request=request, response=response)
-
-        class HTTPErrorClient(FakeAsyncHTTPClient):
-            async def post(
-                self,
-                url: str,
-                *,
-                headers: dict[str, str],
-                json: TavilyRequestBody | OpenAIRequestBody,
-            ) -> FakeHTTPResponse:
-                raise failure
-
-        source = {"title": "Example", "url": "https://example.org", "snippet": "Evidence"}
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "dummy-openai-key", "OPENAI_MODEL": "gpt-4o-mini"}), patch.object(
-            services.httpx, "AsyncClient", HTTPErrorClient
-        ), self.assertLogs(services.logger, level="ERROR") as logs:
-            with self.assertRaises(services.httpx.HTTPStatusError):
-                asyncio.run(services.assess_claim("A factual claim", [source]))
-
-        joined_logs = "\n".join(logs.output)
-        self.assertIn("status=401", joined_logs)
-        self.assertIn("invalid_api_key", joined_logs)
-        self.assertIn("req-test-123", joined_logs)
-        self.assertIn("[REDACTED]", joined_logs)
-        self.assertNotIn(fake_key, joined_logs)
-        self.assertNotIn("dummy-openai-key", joined_logs)
-
-    def test_openai_verdict_reviewer_receives_gemini_analysis_as_untrusted_context(self):
-        source = {"title": "Example", "publisher": "example.org", "url": "https://example.org", "snippet": "Evidence"}
-        FakeAsyncHTTPClient.calls = []
-        FakeAsyncHTTPClient.payload = {"choices": [{"message": {"content": json.dumps({
-            "verdict": "mixed", "explanation": "Evidence is mixed.", "findings": [],
-        })}}]}
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-token"}), patch.object(
-            services.httpx, "AsyncClient", FakeAsyncHTTPClient
-        ):
-            asyncio.run(services.assess_claim("A factual claim", [source], gemini_analysis="Preliminary mixed evidence"))
-        prompt = json.loads(openai_body(FakeAsyncHTTPClient.calls[0][1])["messages"][1]["content"])
-        self.assertEqual(prompt["gemini_preliminary_analysis"], "Preliminary mixed evidence")
-        self.assertIn("fallible", prompt["instruction"])
-
-    def test_invalid_openai_verdict_is_normalized_to_insufficient_evidence(self):
-        source = {"title": "Source", "url": "https://example.org", "snippet": "Text"}
-        FakeAsyncHTTPClient.calls = []
-        FakeAsyncHTTPClient.payload = {
-            "choices": [{"message": {"content": json.dumps({
-                "verdict": "certainly_true",
-                "explanation": "Unsupported verdict label.",
-                "findings": [],
-            })}}]
-        }
-
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-token"}), patch.object(
-            services.httpx, "AsyncClient", FakeAsyncHTTPClient
-        ):
+    def test_gemini_verdict_failure_returns_review_unavailable_and_logs_safely(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        class FailingGeminiClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs): raise RuntimeError("provider unavailable for token dummy-gemini-key")
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"dummy-gemini-key"}), patch.object(genai, "Client", FailingGeminiClient), self.assertLogs(services.logger, level="ERROR") as logs:
             result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIsNone(result["model_confidence"])
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("provider unavailable", joined_logs)
+        self.assertNotIn("dummy-gemini-key", joined_logs)
 
-        self.assertEqual(result["verdict"], "insufficient_evidence")
+    def test_gemini_auth_and_quota_errors_fail_closed_with_clear_limitations(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        for status, expected in ((401, "authentication_or_permission"), (429, "quota_or_rate_limit")):
+            request = httpx.Request("POST", "https://generativelanguage.googleapis.com")
+            failure = httpx.HTTPStatusError("provider error", request=request, response=httpx.Response(status, request=request))
+            class FailingGeminiClient:
+                attempts = 0
+                def __init__(self, *, api_key, http_options): self.models = self
+                def generate_content(self, **kwargs):
+                    FailingGeminiClient.attempts += 1
+                    raise failure
+                def close(self): pass
+            with self.subTest(status=status), patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", FailingGeminiClient):
+                with patch.object(services.time, "sleep"):
+                    result = asyncio.run(services.assess_claim("A factual claim", [source]))
+            self.assertEqual(result["verdict"], "review_unavailable")
+            self.assertIn(expected, result["limitations"][0])
+            if status == 429:
+                self.assertEqual(FailingGeminiClient.attempts, services.GEMINI_VERDICT_MAX_ATTEMPTS)
+
+    def test_invalid_gemini_response_fails_validation(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        class InvalidGeminiClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs): return SimpleNamespace(text='{"verdict":"CERTAINLY_TRUE"}')
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", InvalidGeminiClient):
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIsNone(result["model_confidence"])
+
+    def test_malformed_gemini_json_fails_closed(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        class MalformedGeminiClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs): return SimpleNamespace(text='{"verdict":')
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", MalformedGeminiClient):
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIsNone(result["model_confidence"])
+
+    def test_unavailable_gemini_model_is_logged_and_does_not_return_a_verdict(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        request = httpx.Request("POST", "https://generativelanguage.googleapis.com")
+        failure = httpx.HTTPStatusError("model not found", request=request, response=httpx.Response(404, request=request))
+        class MissingModelClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs): raise failure
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token", "GEMINI_MODEL":"missing-model"}), patch.object(genai, "Client", MissingModelClient), self.assertLogs(services.logger, level="ERROR") as logs:
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIn("invalid_model_or_endpoint", result["limitations"][0])
+        self.assertIn("provider_status=404", "\n".join(logs.output))
+
+    def test_conflicting_support_and_contradiction_returns_insufficient_evidence(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        class ConflictingGeminiClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs):
+                payload = {"verdict":"TRUE", "summary":"Sources disagree.", "model_confidence":0.9, "evidence_coverage":"Conflicting", "findings":[], "supporting_evidence":["One source supports the claim."], "contradicting_evidence":["Another source contradicts it."], "limitations":[]}
+                return SimpleNamespace(text=json.dumps(payload))
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", ConflictingGeminiClient):
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+            self.assertEqual(result["verdict"], "insufficient_evidence")
+        self.assertLessEqual(result["model_confidence"], 0.4)
+
+    def test_gemini_timeout_returns_unavailable_without_claiming_insufficient_evidence(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        class TimedOutGeminiClient:
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs): raise services.httpx.ReadTimeout("timed out")
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", TimedOutGeminiClient):
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "review_unavailable")
+        self.assertIsNone(result["model_confidence"])
+        self.assertIn("network_timeout", result["limitations"][0])
+
+    def test_gemini_transient_server_error_retries_and_then_succeeds(self):
+        source = {"title":"Example", "url":"https://example.org", "snippet":"Evidence"}
+        payload = {"verdict":"TRUE", "summary":"Supported by the source.", "model_confidence":0.8, "evidence_coverage":"Direct evidence.", "findings":[], "supporting_evidence":["Evidence."], "contradicting_evidence":[], "limitations":[]}
+        class RetryingGeminiClient:
+            attempts = 0
+            def __init__(self, *, api_key, http_options): self.models = self
+            def generate_content(self, **kwargs):
+                RetryingGeminiClient.attempts += 1
+                if RetryingGeminiClient.attempts == 1:
+                    request = httpx.Request("POST", "https://generativelanguage.googleapis.com")
+                    raise httpx.HTTPStatusError("busy", request=request, response=httpx.Response(503, request=request))
+                return SimpleNamespace(text=json.dumps(payload))
+            def close(self): pass
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-token"}), patch.object(genai, "Client", RetryingGeminiClient), patch.object(services.time, "sleep"):
+            result = asyncio.run(services.assess_claim("A factual claim", [source]))
+        self.assertEqual(result["verdict"], "supported")
+        self.assertEqual(RetryingGeminiClient.attempts, 2)
 
     def test_gemini_image_analysis_uses_structured_response_and_image_bytes(self):
         class FakeGeminiClient:

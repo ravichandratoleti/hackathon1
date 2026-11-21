@@ -122,8 +122,8 @@ class APIRoutesTests(unittest.TestCase):
             "findings": ["Finding from evidence."],
             "limitations": [],
         }
+        assessment["model_confidence"] = 0.87
         with patch.object(main, "search_sources", new=AsyncMock(return_value=[source])), patch.object(
-            main, "analyze_evidence_gemini", new=AsyncMock(return_value="Preliminary")), patch.object(
             main, "assess_claim", new=AsyncMock(return_value=assessment)
         ) as reviewer:
             response = self.client.post(
@@ -137,53 +137,50 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(body["sources"], [source])
         self.assertEqual(body["summary"], assessment["explanation"])
         self.assertEqual(body["evidence_coverage"], "search_snippets")
-        reviewer.assert_awaited_once_with("A factual claim with enough length.", [source], gemini_analysis="Preliminary")
+        self.assertEqual(body["model_confidence"], 0.87)
+        reviewer.assert_awaited_once_with("A factual claim with enough length.", [source])
 
-    def test_fact_check_tavily_failure_is_unavailable_and_does_not_call_gemini_or_openai(self):
+    def test_fact_check_logs_request_and_review_lifecycle_without_claim_text(self):
+        claim = "Sensitive claim text that should not appear in backend logs."
+        source = {"title":"Source", "publisher":"example.org", "url":"https://example.org/source", "snippet":"Evidence", "published_at":None}
+        assessment = {"verdict":"supported", "explanation":"Supported by supplied evidence.", "findings":[], "limitations":[], "model_confidence":0.8}
+        with patch.object(main, "search_sources", new=AsyncMock(return_value=[source])), patch.object(
+            main, "assess_claim", new=AsyncMock(return_value=assessment)
+        ), self.assertLogs(main.logger, level="INFO") as logs:
+            response = self.client.post("/api/fact-check", json={"claim":claim})
+        self.assertEqual(response.status_code, 200)
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("Fact-check request started", joined_logs)
+        self.assertIn("source_count=1", joined_logs)
+        self.assertIn("Fact-check request completed", joined_logs)
+        self.assertNotIn(claim, joined_logs)
+
+    def test_fact_check_tavily_failure_does_not_call_verdict_reviewer(self):
         from app.services import EvidenceRetrievalError
         with patch.object(main, "search_sources", new=AsyncMock(side_effect=EvidenceRetrievalError("Evidence retrieval is unavailable."))), patch.object(
-            main, "analyze_evidence_gemini", new=AsyncMock()) as gemini, patch.object(
-            main, "assess_claim", new=AsyncMock()) as openai:
+            main, "assess_claim", new=AsyncMock()) as reviewer:
             response = self.client.post("/api/fact-check", json={"claim": "A factual claim with enough length."})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["verdict"], "insufficient_evidence")
         self.assertEqual(response.json()["sources"], [])
-        gemini.assert_not_awaited()
-        openai.assert_not_awaited()
+        reviewer.assert_not_awaited()
 
     def test_fact_check_empty_results_never_generates_verdict(self):
         with patch.object(main, "search_sources", new=AsyncMock(return_value=[])), patch.object(
-            main, "analyze_evidence_gemini", new=AsyncMock()) as gemini, patch.object(
             main, "assess_claim", new=AsyncMock(return_value={"verdict":"insufficient_evidence", "explanation":"Evidence retrieval is unavailable.", "findings":[], "limitations":[]})):
             response = self.client.post("/api/fact-check", json={"claim": "A factual claim with enough length."})
         self.assertEqual(response.json()["verdict"], "insufficient_evidence")
-        gemini.assert_not_awaited()
+        self.assertEqual(response.json()["verdict"], "insufficient_evidence")
 
-    def test_gemini_failure_is_reported_as_limitation_while_openai_reviews_real_sources(self):
-        source = {"title":"Source", "publisher":"example.org", "url":"https://example.org", "snippet":"Actual snippet", "provider":"Tavily"}
-        assessment = {"verdict":"insufficient_evidence", "explanation":"The evidence is insufficient.", "findings":[], "limitations":[]}
-        with patch.object(main, "search_sources", new=AsyncMock(return_value=[source])), patch.object(
-            main, "analyze_evidence_gemini", new=AsyncMock(side_effect=RuntimeError("mock failure"))
-        ), patch.object(main, "assess_claim", new=AsyncMock(return_value=assessment)) as reviewer:
-            response = self.client.post("/api/fact-check", json={"claim":"A factual claim with enough length."})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["sources"], [source])
-        reviewer.assert_awaited_once_with("A factual claim with enough length.", [source], gemini_analysis=None)
-        self.assertTrue(any("Gemini preliminary evidence analysis was unavailable" in x for x in response.json()["limitations"]))
-
-    def test_openai_review_failure_is_never_returned_as_a_successful_verdict(self):
+    def test_gemini_review_failure_is_never_returned_as_a_successful_verdict(self):
         source = {"title": "Source", "publisher": "example.org", "url": "https://example.org", "snippet": "Evidence", "provider": "Tavily"}
-        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-        provider_response = httpx.Response(401, json={"error": {"code": "invalid_api_key"}}, request=request)
-        failure = httpx.HTTPStatusError("HTTP 401", request=request, response=provider_response)
         with patch.object(main, "search_sources", new=AsyncMock(return_value=[source])), patch.object(
-            main, "analyze_evidence_gemini", new=AsyncMock(return_value="Preliminary")
-        ), patch.object(main, "assess_claim", new=AsyncMock(side_effect=failure)):
+            main, "assess_claim", new=AsyncMock(return_value={"verdict":"review_unavailable", "explanation":"Evidence was retrieved, but verdict review is unavailable.", "findings":[], "limitations":["Gemini verdict review is unavailable (authentication_or_permission); no factual verdict was generated."], "model_confidence":None})):
             response = self.client.post("/api/fact-check", json={"claim": "A factual claim with enough length."})
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["verdict"], "insufficient_evidence")
+        self.assertEqual(body["verdict"], "review_unavailable")
         self.assertEqual(body["evidence_coverage"], "search_snippets")
         self.assertEqual(body["sources"], [source])
         self.assertIn("review is unavailable", body["summary"])
