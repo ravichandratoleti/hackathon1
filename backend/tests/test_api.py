@@ -36,6 +36,28 @@ finally:
             os.environ[_name] = _value
 
 
+def image_review_result(
+    assessment="supported",
+    likelihood="low",
+    confidence=0.84,
+    observations=None,
+    indicators=None,
+    reasons=None,
+):
+    return {
+        "assessment": assessment,
+        "summary": "The visible details are broadly consistent with this cautious assessment.",
+        "visual_observations": observations or ["Edges and lighting appear consistent in the inspected regions."],
+        "suspicious_indicators": indicators or [],
+        "manipulation_likelihood": likelihood,
+        "model_confidence": confidence,
+        "metadata_observations": ["No selected EXIF fields were available."],
+        "inconclusive_reasons": reasons or [],
+        "limitations": ["Visual review cannot establish provenance."],
+        "recommended_checks": ["Compare against the original image and an independent source."],
+    }
+
+
 class APIRoutesTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(
@@ -193,14 +215,15 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         search.assert_not_awaited()
 
-    def test_image_route_returns_structured_gemini_observations(self):
+    def test_image_route_maps_supported_assessment_and_preserves_response_compatibility(self):
         image = BytesIO()
         Image.new("RGB", (2, 2), (255, 255, 255)).save(image, format="PNG")
-        gemini_result = {
-            "visual_observations": ["Possible repeated texture; inspect original at full resolution."],
-            "metadata_observations": ["No selected EXIF fields were supplied."],
-            "inconclusive_reasons": ["A single image cannot establish editing history."],
-        }
+        gemini_result = image_review_result(
+            assessment="supported",
+            likelihood="low",
+            confidence=0.84,
+            observations=["Edges and lighting appear consistent in the inspected regions."],
+        )
         with patch.object(main, "gemini_image_configured", return_value=True), patch.object(
             main, "analyze_image_gemini", new=AsyncMock(return_value=gemini_result)
         ) as analyze:
@@ -212,14 +235,22 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["analysis_type"], "image")
-        self.assertEqual(body["verdict"], "inconclusive")
+        self.assertEqual(body["verdict"], "likely_authentic")
+        self.assertEqual(body["assessment"], "supported")
         self.assertIsNone(body["manipulation_likelihood"])
-        self.assertIsNone(body["model_confidence"])
-        self.assertEqual(body["evidence_coverage"], "gemini_image_review")
-        self.assertIn("Possible repeated texture", body["findings"][2]["text"])
-        self.assertEqual(body["findings"][2]["type"], "visual_observation")
-        self.assertEqual(body["findings"][3]["type"], "metadata_observation")
-        self.assertEqual(body["findings"][4]["type"], "inconclusive")
+        self.assertEqual(body["manipulation_likelihood_assessment"], "low")
+        self.assertEqual(body["model_confidence"], 0.84)
+        self.assertEqual(body["evidence_coverage"], "gemini_and_technical_review")
+        by_type = {item["type"]: item for item in body["findings"]}
+        self.assertIn("Edges and lighting", by_type["visual_observation"]["text"])
+        self.assertIn("No selected EXIF fields", by_type["model_metadata_observation"]["text"])
+        self.assertTrue(any(item["type"] == "metadata_evidence" for item in body["findings"]))
+        self.assertNotEqual(by_type["model_metadata_observation"]["type"], "metadata_evidence")
+        self.assertIn("Compare against the original", by_type["recommended_check"]["text"])
+        self.assertIn("not a calibrated probability", by_type["manipulation_likelihood_assessment"]["text"])
+        self.assertTrue(any("SHA-256" in item["text"] and "color mode RGB" in item["text"] for item in body["findings"] if item["type"] == "technical_indicator"))
+        self.assertEqual(body["sources"], [])
+        self.assertEqual(body["limitations"].count("Visual review cannot establish provenance."), 1)
         analyze.assert_awaited_once()
         self.assertEqual(analyze.await_args.args[1], "image/png")
 
@@ -234,11 +265,13 @@ class APIRoutesTests(unittest.TestCase):
 
             def generate_content(self, **kwargs: object) -> SimpleNamespace:
                 FakeGeminiClient.request = kwargs
-                return SimpleNamespace(text=json.dumps({
-                    "visual_observations": ["A possible edge discontinuity is visible."],
-                    "metadata_observations": ["No selected EXIF fields were available."],
-                    "inconclusive_reasons": ["A single image cannot establish editing history."],
-                }))
+                return SimpleNamespace(text=json.dumps(image_review_result(
+                    assessment="suspicious",
+                    likelihood="high",
+                    confidence=0.76,
+                    observations=["A visible seam appears near the object.", "Texture changes abruptly across the seam."],
+                    indicators=["A visible seam appears near the object.", "Texture changes abruptly across the seam."],
+                )))
 
             def close(self) -> None:
                 pass
@@ -260,10 +293,31 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["analysis_type"], "image")
-        self.assertEqual(body["verdict"], "inconclusive")
-        self.assertIsNone(body["model_confidence"])
-        self.assertEqual(body["evidence_coverage"], "gemini_image_review")
-        self.assertIn("possible edge discontinuity", body["findings"][2]["text"])
+        self.assertEqual(body["verdict"], "potentially_manipulated")
+        self.assertEqual(body["assessment"], "suspicious")
+        self.assertEqual(body["manipulation_likelihood_assessment"], "high")
+        self.assertEqual(body["model_confidence"], 0.76)
+        self.assertEqual(body["evidence_coverage"], "gemini_and_technical_review")
+        self.assertIn("A visible seam appears", " ".join(item["text"] for item in body["findings"]))
+        actual_pdf = self.client.get(f"/api/report/{body['id']}")
+        self.assertEqual(actual_pdf.status_code, 200)
+        self.assertEqual(actual_pdf.headers["content-type"], "application/pdf")
+        self.assertTrue(actual_pdf.content.startswith(b"%PDF"))
+
+        class RecordingPDF:
+            def __init__(self, buffer, **kwargs): self.buffer = buffer
+            def drawString(self, x, y, text): self.lines.append(text)
+            def showPage(self): pass
+            def save(self): self.buffer.write(b"%PDF-recorded")
+            lines = []
+        with patch.object(main.canvas, "Canvas", RecordingPDF):
+            pdf = self.client.get(f"/api/report/{body['id']}")
+        self.assertEqual(pdf.status_code, 200)
+        self.assertEqual(pdf.content, b"%PDF-recorded")
+        self.assertIn("Authenticity assessment: suspicious", RecordingPDF.lines)
+        self.assertIn("Manipulation likelihood: high", RecordingPDF.lines)
+        self.assertIn("Assessment confidence: 0.76", RecordingPDF.lines)
+        self.assertTrue(any("Compare against the original image" in item for item in RecordingPDF.lines))
         request = FakeGeminiClient.request
         self.assertIsNotNone(request)
         assert request is not None
@@ -285,6 +339,7 @@ class APIRoutesTests(unittest.TestCase):
             raise AssertionError("Expected the production structured JSON configuration")
         self.assertEqual(request_config.response_mime_type, "application/json")
         self.assertIs(request_config.response_schema, services.GeminiImageForensics)
+        self.assertNotIn("additionalProperties", services.GeminiImageForensics.model_json_schema())
         self.assertIsNotNone(FakeGeminiClient.http_options)
         if FakeGeminiClient.http_options is None:
             raise AssertionError("Expected Gemini HTTP client options")
@@ -312,9 +367,101 @@ class APIRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["verdict"], "inconclusive")
+        self.assertEqual(body["assessment"], "inconclusive")
         self.assertIsNone(body["model_confidence"])
+        self.assertEqual(body["manipulation_likelihood_assessment"], "unavailable")
         self.assertEqual(body["evidence_coverage"], "metadata_only")
         self.assertNotIn("visual_observation", [finding["type"] for finding in body["findings"]])
+
+    def test_image_insufficient_evidence_returns_inconclusive_with_unavailable_scores(self):
+        image = BytesIO()
+        Image.new("RGB", (2, 2), (255, 255, 255)).save(image, format="PNG")
+        result = image_review_result(
+            assessment="inconclusive",
+            likelihood="unavailable",
+            confidence=None,
+            reasons=["The image is too small to assess local detail reliably."],
+        )
+        with patch.object(main, "gemini_image_configured", return_value=True), patch.object(
+            main, "analyze_image_gemini", new=AsyncMock(return_value=result)
+        ):
+            response = self.client.post("/api/analyze/image", files={"file": ("small.png", image.getvalue(), "image/png")})
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["assessment"], "inconclusive")
+        self.assertEqual(body["manipulation_likelihood_assessment"], "unavailable")
+        self.assertIsNone(body["model_confidence"])
+        self.assertTrue(any("too small" in f["text"] for f in body["findings"]))
+
+    def test_selected_image_metadata_reports_gps_presence_without_coordinates(self):
+        class FakeExif:
+            def items(self):
+                return [(34853, {1:"N", 2:(37, 46, 30), 3:"W", 4:(122, 25, 0)}), (272, "Example Camera")]
+            def get_ifd(self, ifd):
+                return {1:"N", 2:(37, 46, 30), 3:"W", 4:(122, 25, 0)}
+        class FakeImage:
+            def getexif(self): return FakeExif()
+
+        metadata = main.selected_image_metadata(FakeImage())
+        self.assertIn("GPS metadata present", metadata["GPSInfo"])
+        self.assertEqual(metadata["Model"], "Example Camera")
+        self.assertNotIn("37", metadata["GPSInfo"])
+        self.assertNotIn("122", metadata["GPSInfo"])
+
+    def test_image_integrity_reports_sha256_png_and_color_mode(self):
+        import hashlib
+        image_data = BytesIO()
+        Image.new("RGBA", (12, 9), (1, 2, 3, 255)).save(image_data, format="PNG")
+        payload = image_data.getvalue()
+        with Image.open(BytesIO(payload)) as image:
+            findings = main.analyze_image_integrity(payload, image, {})
+        report = " ".join(findings)
+        self.assertIn(hashlib.sha256(payload).hexdigest(), report)
+        self.assertIn("format PNG", report)
+        self.assertIn("color mode RGBA", report)
+        self.assertIn("12 × 9 pixels", report)
+        self.assertIn("Missing", report) if "Missing" in report else self.assertIn("not evidence of manipulation", report)
+
+    def test_image_integrity_jpeg_adds_experimental_recompression_indicator(self):
+        image_data = BytesIO()
+        Image.new("RGB", (80, 70), (120, 80, 40)).save(image_data, format="JPEG", quality=75)
+        with Image.open(BytesIO(image_data.getvalue())) as image:
+            findings = main.analyze_image_integrity(image_data.getvalue(), image, {})
+        self.assertTrue(any("Experimental JPEG recompression comparison" in item for item in findings))
+        self.assertTrue(any("does not localize edits or establish manipulation" in item for item in findings))
+
+    def test_malformed_metadata_is_flagged_without_verdicting_manipulation(self):
+        image_data = BytesIO()
+        Image.new("RGB", (80, 70)).save(image_data, format="PNG")
+        with Image.open(BytesIO(image_data.getvalue())) as image:
+            findings = main.analyze_image_integrity(image_data.getvalue(), image, {
+                "DateTimeOriginal": "not-a-timestamp", "ImageWidth": "999", "Software": "Editor X",
+            })
+        report = " ".join(findings)
+        self.assertIn("not in the usual EXIF timestamp format", report)
+        self.assertIn("differs from decoded dimensions", report)
+        self.assertIn("does not by itself establish editing or manipulation", report)
+
+    def test_metadata_conflict_overrides_gemini_as_inconclusive(self):
+        image_data = BytesIO()
+        Image.new("RGB", (20, 15)).save(image_data, format="PNG")
+        result = image_review_result(assessment="supported", likelihood="low", confidence=0.84)
+        with patch.object(main, "selected_image_metadata", return_value={"ImageWidth": "999"}), patch.object(
+            main, "gemini_image_configured", return_value=True
+        ), patch.object(main, "analyze_image_gemini", new=AsyncMock(return_value=result)):
+            response = self.client.post("/api/analyze/image", files={"file": ("conflict.png", image_data.getvalue(), "image/png")})
+        body = response.json()
+        self.assertEqual(body["assessment"], "inconclusive")
+        self.assertEqual(body["manipulation_likelihood_assessment"], "unavailable")
+        self.assertIsNone(body["model_confidence"])
+        self.assertIn("metadata inconsistencies", body["summary"])
+
+    def test_unusual_image_dimensions_are_reported_as_review_limit(self):
+        image_data = BytesIO()
+        Image.new("RGB", (16, 16)).save(image_data, format="PNG")
+        with Image.open(BytesIO(image_data.getvalue())) as image:
+            findings = main.analyze_image_integrity(image_data.getvalue(), image, {})
+        self.assertTrue(any("unusually small dimensions" in item for item in findings))
 
     def test_image_health_uses_gemini_configuration(self):
         with patch.object(main, "gemini_image_configured", return_value=True):

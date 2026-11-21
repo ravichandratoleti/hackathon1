@@ -1,3 +1,4 @@
+import hashlib
 import json, os, uuid
 import logging
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from PIL import ExifTags, Image, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageChops, ImageStat, UnidentifiedImageError
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sqlalchemy.exc import SQLAlchemyError
@@ -62,11 +63,16 @@ def root():
 
 
 def packed(row):
-    return {"id": row.id, "analysis_type": row.analysis_type, "original_filename": row.original_filename,
+    findings = json.loads(row.findings_json)
+    result = {"id": row.id, "analysis_type": row.analysis_type, "original_filename": row.original_filename,
             "verdict": row.verdict, "manipulation_likelihood": row.manipulation_likelihood,
             "model_confidence": row.model_confidence, "evidence_coverage": row.evidence_coverage,
-            "summary": row.summary, "findings": json.loads(row.findings_json), "sources": json.loads(row.sources_json),
+            "summary": row.summary, "findings": findings, "sources": json.loads(row.sources_json),
             "limitations": json.loads(row.limitations_json), "created_at": row.created_at}
+    if row.analysis_type == "image":
+        result["assessment"] = next((item.get("value") for item in findings if item.get("type") == "image_assessment"), "inconclusive")
+        result["manipulation_likelihood_assessment"] = next((item.get("value") for item in findings if item.get("type") == "manipulation_likelihood_assessment"), "unavailable")
+    return result
 
 def save(db, kind, filename, verdict, summary, findings=None, sources=None, limitations=None, likelihood=None, confidence=None, coverage="not_available"):
     row = Analysis(id=str(uuid.uuid4()), analysis_type=kind, original_filename=filename, verdict=verdict,
@@ -118,7 +124,7 @@ async def read_upload(file, allowed):
 
 
 def selected_image_metadata(image: Image.Image) -> dict[str, str]:
-    """Return a small technical EXIF allowlist; intentionally omit GPS and comments."""
+    """Return allowlisted technical EXIF fields, reporting GPS presence without coordinates."""
     tags = {
         "DateTime", "DateTimeOriginal", "DateTimeDigitized", "Make", "Model", "Software",
         "Orientation", "ImageWidth", "ImageLength", "ExifImageWidth", "ExifImageHeight",
@@ -130,6 +136,14 @@ def selected_image_metadata(image: Image.Image) -> dict[str, str]:
     metadata: dict[str, str] = {}
     for tag_id, value in exif.items():
         name = ExifTags.TAGS.get(tag_id)
+        if name == "GPSInfo":
+            try:
+                gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+            except (AttributeError, KeyError, OSError, TypeError, ValueError):
+                gps = None
+            if gps:
+                metadata["GPSInfo"] = "GPS metadata present; precise coordinates withheld"
+            continue
         if name not in tags or isinstance(value, (bytes, bytearray)):
             continue
         value_text = str(value).strip()
@@ -137,20 +151,74 @@ def selected_image_metadata(image: Image.Image) -> dict[str, str]:
             metadata[name] = value_text[:160]
     return metadata
 
+
+def analyze_image_integrity(data: bytes, image: Image.Image, metadata: dict[str, str]) -> list[str]:
+    """Return reproducible file facts and cautious technical indicators, never a verdict."""
+    width, height = image.size
+    findings = [
+        f"File integrity: SHA-256 {hashlib.sha256(data).hexdigest()}; {len(data)} bytes; "
+        f"format {image.format or 'unknown'}; {width} × {height} pixels; color mode {image.mode}.",
+    ]
+    if width < 64 or height < 64:
+        findings.append("The image has unusually small dimensions for detailed visual review; local artifacts may not be assessable.")
+    if width > 100_000 or height > 100_000 or width * height > 100_000_000:
+        findings.append("The image dimensions are unusually large; interpret visual and resampling indicators cautiously.")
+    if metadata.get("Software"):
+        findings.append(f"Metadata identifies software as {metadata['Software']!r}. This records an application tag and does not by itself establish editing or manipulation.")
+    for key in ("DateTime", "DateTimeOriginal", "DateTimeDigitized"):
+        value = metadata.get(key)
+        if value:
+            try:
+                datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+            except ValueError:
+                findings.append(f"The {key} metadata value is not in the usual EXIF timestamp format; the value may be malformed or nonstandard.")
+    for key, actual in (("ImageWidth", width), ("ExifImageWidth", width), ("ImageLength", height), ("ExifImageHeight", height)):
+        value = metadata.get(key)
+        if value:
+            try:
+                if int(value) != actual:
+                    findings.append(f"Metadata {key} ({value}) differs from decoded dimensions ({width} × {height}); this is an inconsistency to verify, not proof of manipulation.")
+            except ValueError:
+                findings.append(f"Metadata {key} is not a valid integer dimension.")
+    if image.format == "JPEG" and width * height <= 20_000_000:
+        try:
+            original = image.convert("RGB")
+            encoded = BytesIO()
+            original.save(encoded, format="JPEG", quality=90)
+            encoded.seek(0)
+            with Image.open(encoded) as recompressed:
+                difference = ImageChops.difference(original, recompressed.convert("RGB"))
+                mean = sum(ImageStat.Stat(difference).mean) / 3
+            findings.append(
+                f"Experimental JPEG recompression comparison (quality 90) mean channel difference: {mean:.2f}/255. "
+                "This global comparison is sensitive to image content, quality, and prior saves; it does not localize edits or establish manipulation."
+            )
+        except (OSError, ValueError):
+            findings.append("Experimental JPEG recompression comparison was unavailable for this file.")
+    elif image.format == "JPEG":
+        findings.append("Experimental JPEG recompression comparison was skipped because the image exceeds the 20-megapixel processing limit.")
+    if not metadata:
+        findings.append("No selected EXIF fields were available. This is common and is not evidence of manipulation.")
+    return findings
+
 @app.post("/api/analyze/image")
 async def analyze_image(file: UploadFile=File(...), db: Session=Depends(get_db)):
     data=await read_upload(file,{".jpg",".jpeg",".png",".webp"})
     try:
         image=Image.open(BytesIO(data)); image.verify()
         with Image.open(BytesIO(data)) as img:
-            width,height,fmt=img.width,img.height,img.format
+            if img.width * img.height > 100_000_000:
+                raise HTTPException(400,"The uploaded image dimensions exceed the safe analysis limit.")
+            width,height,fmt,color_mode=img.width,img.height,img.format,img.mode
             embedded_metadata=selected_image_metadata(img)
-    except (UnidentifiedImageError,OSError,ValueError): raise HTTPException(400,"The uploaded file is not a readable image.")
-    findings=[{"type":"metadata","text":f"Readable {fmt} image, {width} × {height} pixels. Metadata alone does not establish authenticity."}]
+            technical_findings=analyze_image_integrity(data,img,embedded_metadata)
+    except (UnidentifiedImageError,OSError,ValueError,Image.DecompressionBombError,Image.DecompressionBombWarning): raise HTTPException(400,"The uploaded file is not a readable image or exceeds the safe image processing limit.")
+    findings=[{"type":"metadata_observation","text":f"Readable {fmt} image, {width} × {height} pixels. Metadata alone does not establish authenticity."}]
     if embedded_metadata:
         findings.append({"type":"metadata_evidence","text":"Selected embedded EXIF fields: "+", ".join(f"{key}={value}" for key,value in sorted(embedded_metadata.items()))})
     else:
-        findings.append({"type":"metadata_evidence","text":"No selected embedded EXIF fields were available for comparison."})
+        findings.append({"type":"metadata_evidence","text":"No selected embedded EXIF fields were available. Missing metadata is common and is not evidence of manipulation."})
+    findings.extend({"type":"technical_indicator", "text":item} for item in technical_findings)
     configured=gemini_image_configured()
     model_failed=False
     result=None
@@ -161,6 +229,9 @@ async def analyze_image(file: UploadFile=File(...), db: Session=Depends(get_db))
                 "container_format":str(fmt or "unknown"),
                 "width_px":str(width),
                 "height_px":str(height),
+                "color_mode":color_mode,
+                "file_size_bytes":str(len(data)),
+                "sha256":hashlib.sha256(data).hexdigest(),
                 **embedded_metadata,
             }
             result=await analyze_image_gemini(data,mime_type,metadata_context)
@@ -168,23 +239,44 @@ async def analyze_image(file: UploadFile=File(...), db: Session=Depends(get_db))
             logger.error("Gemini image route failed error_type=%s", type(exc).__name__)
             model_failed=True
     if result:
-        for observation in result["visual_observations"]:
-            findings.append({"type":"visual_observation","text":observation})
-        for observation in result["metadata_observations"]:
-            findings.append({"type":"metadata_observation","text":observation})
-        for reason in result["inconclusive_reasons"]:
-            findings.append({"type":"inconclusive","text":reason})
-        likelihood=confidence=None
-        verdict="inconclusive"
-        summary="Gemini returned visual observations and a review of available metadata. No authenticity verdict or confidence score was assigned."
-        limits=["Visual observations are model-generated indicators and do not prove authenticity or manipulation.","Embedded metadata may be missing, altered, or inconsistent with the image content."]
-        coverage="gemini_image_review"
+        assessment=result["assessment"]
+        # Technical metadata contradictions are independent evidence that warrants review;
+        # never let the model's visual-only assessment overrule a detected conflict.
+        metadata_conflict = any("differs from decoded dimensions" in item or "not a valid integer dimension" in item or "not in the usual EXIF timestamp format" in item for item in technical_findings)
+        if metadata_conflict:
+            assessment = "inconclusive"
+            findings.append({"type":"inconclusive","text":"Technical metadata conflicts with the decoded image properties; verify against the original file before drawing an authenticity conclusion."})
+        likelihood_level="unavailable" if metadata_conflict else result["manipulation_likelihood"]
+        confidence=result["model_confidence"] if assessment != "inconclusive" and not metadata_conflict else None
+        summary=(result["summary"] + " Technical metadata inconsistencies were found, so the combined assessment is inconclusive.") if metadata_conflict else result["summary"]
+        verdict={"supported":"likely_authentic","suspicious":"potentially_manipulated","inconclusive":"inconclusive"}[assessment]
+        findings.extend([
+            {"type":"image_assessment","value":assessment,"text":f"Authenticity assessment: {assessment}. {summary}"},
+            {"type":"manipulation_likelihood_assessment","value":likelihood_level,"text":f"Qualitative manipulation likelihood: {likelihood_level}. This is not a calibrated probability."},
+        ])
+        for field, finding_type in (
+            ("visual_observations", "visual_observation"),
+            ("suspicious_indicators", "suspicious_indicator"),
+            ("metadata_observations", "model_metadata_observation"),
+            ("inconclusive_reasons", "inconclusive"),
+            ("recommended_checks", "recommended_check"),
+        ):
+            findings.extend({"type":finding_type,"text":item} for item in result[field])
+        limits=result["limitations"] + ["Assessment confidence describes confidence in this assessment; it is not a calibrated probability that the image is authentic or manipulated.","Visual indicators and metadata do not provide forensic certification. A single anomaly does not prove manipulation.","Technical integrity observations are computed independently. The JPEG recompression comparison is experimental and is not a manipulation detector."]
+        coverage="gemini_and_technical_review"
     else:
-        likelihood=confidence=None; verdict="inconclusive"
-        summary="Image received and validated, but no authenticity assessment was performed. " + ("The configured model service did not return a usable result." if configured else "No image detection model is configured.")
-        limits=["Check GEMINI_API_KEY, GEMINI_IMAGE_MODEL, SDK availability, and the provider error logs." if model_failed else "Configure GEMINI_API_KEY and GEMINI_IMAGE_MODEL to enable image analysis."]
+        assessment="inconclusive"
+        likelihood_level="unavailable"
+        confidence=None
+        verdict="inconclusive"
+        summary="Image was received, but Gemini did not return a usable authenticity assessment. No verdict or confidence was assigned."
+        findings.extend([
+            {"type":"image_assessment","value":assessment,"text":"Authenticity assessment: inconclusive. No model assessment was completed."},
+            {"type":"manipulation_likelihood_assessment","value":likelihood_level,"text":"Qualitative manipulation likelihood: unavailable."},
+        ])
+        limits=["Check GEMINI_API_KEY, GEMINI_IMAGE_MODEL, SDK availability, and the backend provider error logs." if model_failed else "Configure GEMINI_API_KEY and GEMINI_IMAGE_MODEL to enable image analysis."]
         coverage="metadata_only"
-    row=save(db,"image",Path(file.filename or "image").name,verdict,summary,findings,limitations=limits,likelihood=likelihood,confidence=confidence,coverage=coverage)
+    row=save(db,"image",Path(file.filename or "image").name,verdict,summary,findings,limitations=limits,likelihood=None,confidence=confidence,coverage=coverage)
     return packed(row)
 
 @app.post("/api/analyze/{kind}")
@@ -240,6 +332,12 @@ def report(analysis_id: str,db: Session=Depends(get_db)):
         if y<60: pdf.showPage(); y=750
         pdf.drawString(50,y,str(text).encode("latin-1","replace").decode("latin-1")[:110]); y-=18
     line("VERITAS AI - Verification report"); line(f"ID: {row.id}"); line(f"Type: {row.analysis_type}"); line(f"Verdict: {row.verdict}")
+    if row.analysis_type == "image":
+        image_result=packed(row)
+        line(f"Authenticity assessment: {image_result['assessment']}")
+        line(f"Manipulation likelihood: {image_result['manipulation_likelihood_assessment']}")
+        line(f"Assessment confidence: {row.model_confidence if row.model_confidence is not None else 'Unavailable'}")
+        line("Confidence means confidence in this assessment, not a calibrated probability of authenticity or manipulation.")
     line(f"Created: {row.created_at.isoformat()}"); line(f"Summary: {row.summary}")
     for item in json.loads(row.findings_json): line("Finding: "+str(item.get("text",item)))
     for item in json.loads(row.sources_json): line(f"Source: {item.get('title')} - {item.get('publisher')} [{item.get('provider', 'unknown provider')}] - {item.get('url')}")

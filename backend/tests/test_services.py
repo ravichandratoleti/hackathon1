@@ -81,6 +81,28 @@ def interaction_with_citations(*annotations, text="Evidence text."):
     return SimpleNamespace(steps=[step])
 
 
+def gemini_image_payload(
+    assessment="supported",
+    likelihood="low",
+    confidence=0.82,
+    visual=None,
+    indicators=None,
+    inconclusive=None,
+):
+    return {
+        "assessment": assessment,
+        "summary": "Visible details are broadly consistent with the assessment, but this is not certification.",
+        "visual_observations": visual or ["The main subject has consistent edges and lighting."],
+        "suspicious_indicators": indicators or [],
+        "manipulation_likelihood": likelihood,
+        "model_confidence": confidence,
+        "metadata_observations": ["No selected embedded EXIF fields were supplied."],
+        "inconclusive_reasons": inconclusive or [],
+        "limitations": ["A single visual review cannot establish image provenance."],
+        "recommended_checks": ["Compare with the original file and an independent source."],
+    }
+
+
 class FakeHTTPResponse:
     def __init__(self, payload: object, status_code: int = 200) -> None:
         self.payload = payload
@@ -493,11 +515,12 @@ class ServicesTests(unittest.TestCase):
                 config: types.GenerateContentConfig,
             ) -> SimpleNamespace:
                 FakeGeminiClient.request = {"model": model, "contents": contents, "config": config}
-                return SimpleNamespace(text=json.dumps({
-                    "visual_observations": ["Shadow direction appears inconsistent."],
-                    "metadata_observations": ["EXIF Software field is present."],
-                    "inconclusive_reasons": ["The original capture is unavailable."],
-                }))
+                return SimpleNamespace(text=json.dumps(gemini_image_payload(
+                    assessment="suspicious",
+                    likelihood="high",
+                    indicators=["The subject boundary has a sharp brightness discontinuity.", "Foreground and background shadows point in conflicting directions."],
+                    visual=["The subject boundary has a sharp brightness discontinuity.", "Foreground and background shadows point in conflicting directions."],
+                )))
 
             def close(self) -> None:
                 FakeGeminiClient.closed = True
@@ -507,8 +530,11 @@ class ServicesTests(unittest.TestCase):
         ):
             result = asyncio.run(services.analyze_image_gemini(b"image bytes", "image/png", {"Software": "Camera"}))
 
-        self.assertEqual(result["visual_observations"], ["Shadow direction appears inconsistent."])
-        self.assertEqual(result["metadata_observations"], ["EXIF Software field is present."])
+        self.assertEqual(result["assessment"], "suspicious")
+        self.assertEqual(result["manipulation_likelihood"], "high")
+        self.assertEqual(result["model_confidence"], 0.82)
+        self.assertEqual(len(result["suspicious_indicators"]), 2)
+        self.assertEqual(result["metadata_observations"], ["No selected embedded EXIF fields were supplied."])
         request = required(FakeGeminiClient.request, "Gemini image request")
         self.assertEqual(request["model"], "gemini-3.8-flash")
         image_part = request["contents"][1]
@@ -524,6 +550,7 @@ class ServicesTests(unittest.TestCase):
         config = request["config"]
         self.assertEqual(config.response_mime_type, "application/json")
         self.assertIs(config.response_schema, services.GeminiImageForensics)
+        self.assertNotIn("additionalProperties", services.GeminiImageForensics.model_json_schema())
         init_kwargs = required(FakeGeminiClient.init_kwargs, "Gemini client options")
         self.assertEqual(init_kwargs["http_options"].timeout, services.GEMINI_IMAGE_TIMEOUT_MS)
         self.assertEqual(services.GEMINI_IMAGE_TIMEOUT_MS, 90_000)
@@ -558,11 +585,13 @@ class ServicesTests(unittest.TestCase):
                 config: types.GenerateContentConfig,
             ) -> SimpleNamespace:
                 FakeGeminiClient.request = {"model": model, "contents": contents, "config": config}
-                return SimpleNamespace(text=json.dumps({
-                    "visual_observations": [],
-                    "metadata_observations": [],
-                    "inconclusive_reasons": ["Insufficient detail."],
-                }))
+                return SimpleNamespace(text=json.dumps(gemini_image_payload(
+                    assessment="inconclusive",
+                    likelihood="unavailable",
+                    confidence=None,
+                    visual=["Only a small, blurred region is available."],
+                    inconclusive=["Image detail is insufficient for a reliable assessment."],
+                )))
 
             def close(self) -> None: pass
 
@@ -632,11 +661,12 @@ class ServicesTests(unittest.TestCase):
                 FakeGeminiClient.calls += 1
                 if FakeGeminiClient.calls < 3:
                     raise ProviderError("temporary rate limit")
-                return SimpleNamespace(text=json.dumps({
-                    "visual_observations": ["A visible seam appears near the object."],
-                    "metadata_observations": [],
-                    "inconclusive_reasons": [],
-                }))
+                return SimpleNamespace(text=json.dumps(gemini_image_payload(
+                    assessment="suspicious",
+                    likelihood="medium",
+                    indicators=["A visible seam appears near the object.", "Texture changes abruptly on one side of the seam."],
+                    visual=["A visible seam appears near the object.", "Texture changes abruptly on one side of the seam."],
+                )))
 
             def close(self):
                 pass
@@ -647,9 +677,60 @@ class ServicesTests(unittest.TestCase):
         ), patch.object(services.asyncio, "sleep", new=sleep):
             result = asyncio.run(services.analyze_image_gemini(b"image", "image/png", {}))
 
-        self.assertEqual(result["visual_observations"], ["A visible seam appears near the object."])
+        self.assertEqual(result["visual_observations"], ["A visible seam appears near the object.", "Texture changes abruptly on one side of the seam."])
         self.assertEqual(FakeGeminiClient.calls, 3)
         self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 2.0])
+
+    def test_gemini_image_analysis_keeps_missing_confidence_unavailable(self):
+        payload = gemini_image_payload()
+        payload.pop("model_confidence")
+
+        class FakeGeminiClient:
+            def __init__(self, **kwargs): self.models = self
+            def generate_content(self, **kwargs): return SimpleNamespace(text=json.dumps(payload))
+            def close(self): pass
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-gemini-key"}), patch.object(genai, "Client", FakeGeminiClient):
+            result = asyncio.run(services.analyze_image_gemini(b"image", "image/jpeg", {}))
+        self.assertEqual(result["assessment"], "supported")
+        self.assertIsNone(result["model_confidence"])
+
+    def test_gemini_image_insufficient_evidence_forces_unavailable_scores(self):
+        payload = gemini_image_payload(
+            assessment="inconclusive",
+            likelihood="medium",
+            confidence=0.9,
+            inconclusive=["Only a compressed thumbnail was available."],
+        )
+
+        class FakeGeminiClient:
+            def __init__(self, **kwargs): self.models = self
+            def generate_content(self, **kwargs): return SimpleNamespace(text=json.dumps(payload))
+            def close(self): pass
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-gemini-key"}), patch.object(genai, "Client", FakeGeminiClient):
+            result = asyncio.run(services.analyze_image_gemini(b"image", "image/jpeg", {}))
+        self.assertEqual(result["manipulation_likelihood"], "unavailable")
+        self.assertIsNone(result["model_confidence"])
+
+    def test_gemini_image_duplicate_single_indicator_is_downgraded(self):
+        payload = gemini_image_payload(
+            assessment="suspicious",
+            likelihood="high",
+            indicators=["One abrupt edge is visible.", "One abrupt edge is visible."],
+        )
+
+        class FakeGeminiClient:
+            def __init__(self, **kwargs): self.models = self
+            def generate_content(self, **kwargs): return SimpleNamespace(text=json.dumps(payload))
+            def close(self): pass
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY":"test-gemini-key"}), patch.object(genai, "Client", FakeGeminiClient):
+            result = asyncio.run(services.analyze_image_gemini(b"image", "image/jpeg", {}))
+        self.assertEqual(result["assessment"], "inconclusive")
+        self.assertEqual(result["manipulation_likelihood"], "unavailable")
+        self.assertIsNone(result["model_confidence"])
+        self.assertIn("multiple distinct", result["summary"])
 
     def test_gemini_image_analysis_stops_after_three_retries(self):
         class ProviderError(Exception):
